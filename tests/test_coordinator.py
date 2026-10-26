@@ -111,6 +111,23 @@ class TestResourceAndGuidance(unittest.TestCase):
         self.assertIn("Bitmask is off for 29-bit frames", prompt)
         self.assertIn("Watcher (Claude Code)", prompt)
 
+    def test_live_logs_retrieval(self):
+        test_dir = Path(tempfile.mkdtemp())
+        try:
+            log_dir = test_dir / ".coordinator" / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_file = log_dir / "agy_task-99.log"
+            log_file.write_text("line 1\nline 2\nline 3\nline 4\nline 5\n")
+
+            orch = CoordinatorOrchestrator(test_dir, auto_git_init=False)
+            info = orch.get_live_logs(task_id="task-99", lines=3)
+            self.assertTrue(info["found"])
+            self.assertEqual(len(info["tail"]), 3)
+            self.assertEqual(info["tail"], ["line 3", "line 4", "line 5"])
+            self.assertEqual(info["total_lines"], 5)
+        finally:
+            shutil.rmtree(test_dir, ignore_errors=True)
+
 
 class TestCLI(unittest.TestCase):
     def setUp(self):
@@ -125,6 +142,14 @@ class TestCLI(unittest.TestCase):
         self.assertTrue((self.test_dir / "AGENTS.md").exists())
 
         exit_code = main(["status", "--path", str(self.test_dir)])
+        self.assertEqual(exit_code, 0)
+
+    def test_cli_logs(self):
+        log_dir = self.test_dir / ".coordinator" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "agy_sample.log").write_text("status: running tests\nall tests pass\n")
+
+        exit_code = main(["logs", "sample", "--lines", "2", "--path", str(self.test_dir)])
         self.assertEqual(exit_code, 0)
 
 

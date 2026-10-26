@@ -47,6 +47,13 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
     guide_p.add_argument("--timeout", type=int, default=0, help="Timeout in seconds (0 = unlimited)")
     guide_p.add_argument("--path", default=".", help="Project directory")
 
+    # logs
+    logs_p = subparsers.add_parser("logs", help="View or live-tail agy task execution logs.")
+    logs_p.add_argument("task_id", nargs="?", default=None, help="Task ID (default: most recent task)")
+    logs_p.add_argument("-n", "--lines", type=int, default=30, help="Number of recent lines to display (default 30)")
+    logs_p.add_argument("-f", "--follow", action="store_true", help="Live-tail following new lines as they are written")
+    logs_p.add_argument("--path", default=".", help="Project directory")
+
     # run
     run_p = subparsers.add_parser("run", help="Run a single or multi-agent task.")
     run_p.add_argument("prompt", help="Goal or task prompt")
@@ -147,6 +154,37 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"  Duration: {report.duration_seconds:.1f}s")
         print(f"  Updated Report: .coordinator/reports/{report.task_id}_report.md")
         return 0 if report.status == TaskStatus.COMPLETED else 1
+
+    elif args.subcommand == "logs":
+        log_info = orchestrator.get_live_logs(task_id=args.task_id, lines=args.lines)
+        if not log_info.get("found"):
+            print(f"❌ {log_info.get('message', 'No log files found.')}")
+            return 1
+
+        log_file = Path(log_info["log_file"])
+        print(f"📄 Tailing log: {log_file}")
+        print(f"   Last updated: {log_info.get('modified_seconds_ago', 0):.1f}s ago | Total lines: {log_info.get('total_lines')}\n---")
+
+        for line in log_info.get("tail", []):
+            print(line)
+
+        if args.follow:
+            print("\n👀 Following live output (Ctrl+C to stop)...")
+            import time
+            try:
+                with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+                    f.seek(0, 2)  # seek to current end
+                    while True:
+                        line = f.readline()
+                        if line:
+                            sys.stdout.write(line)
+                            sys.stdout.flush()
+                        else:
+                            time.sleep(0.5)
+            except KeyboardInterrupt:
+                print("\n⏹️ Stopped following logs.")
+                return 0
+        return 0
 
     elif args.subcommand == "run":
         files = [f.strip() for f in args.files.split(",")] if args.files else []

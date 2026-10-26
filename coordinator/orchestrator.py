@@ -251,6 +251,51 @@ class CoordinatorOrchestrator:
 
         return report
 
+    def get_live_logs(self, task_id: Optional[str] = None, lines: int = 30) -> Dict[str, Any]:
+        """
+        Inspect live progress and recent logs of an agy task without spending LLM tokens.
+        """
+        all_logs = []
+        # Search coordinator logs and worktree logs
+        log_dirs = [self.coord_dir / "logs"]
+        wt_base = self.coord_dir / "worktrees"
+        if wt_base.exists():
+            for p in wt_base.iterdir():
+                if p.is_dir() and (p / ".coordinator" / "logs").exists():
+                    log_dirs.append(p / ".coordinator" / "logs")
+
+        for ld in log_dirs:
+            if ld.exists():
+                for f in ld.glob("*.log"):
+                    all_logs.append(f)
+
+        if not all_logs:
+            return {"found": False, "message": "No log files found."}
+
+        # Filter by task_id if provided
+        target_log = None
+        if task_id:
+            for l in all_logs:
+                if task_id in l.name:
+                    target_log = l
+                    break
+        if not target_log:
+            # Most recent log
+            target_log = max(all_logs, key=lambda p: p.stat().st_mtime)
+
+        try:
+            content = target_log.read_text(encoding="utf-8", errors="replace").splitlines()
+            tail_lines = content[-lines:] if len(content) > lines else content
+            return {
+                "found": True,
+                "log_file": str(target_log),
+                "total_lines": len(content),
+                "tail": tail_lines,
+                "modified_seconds_ago": time.time() - target_log.stat().st_mtime,
+            }
+        except Exception as e:
+            return {"found": False, "error": str(e)}
+
     def cleanup_all_worktrees(self) -> int:
         """Clean up all coordinator worktrees and temporary workspaces."""
         count = 0

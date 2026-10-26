@@ -90,7 +90,11 @@ The coordinator is registered as a native MCP server (`coordinator`) connected t
 
 - **Check status & active tasks**:
   > *"What's the status of running coordinator tasks?"*  
-  *(Claude calls `coord_status` to view active worktrees and recent reports)*
+  *(Claude calls `coord_status` to view active worktrees, GPU health, and recent reports)*
+
+- **Watch Live Progress & Logs (Zero Token Inspection)**:
+  > *"Watch over agy's execution. How is it progressing?"*  
+  *(Claude calls `coord_logs` to view recent live output directly from the task log file)*
 
 - **Review, Guide, and Merge**:
   > *"Inspect agy's report, verify tests, and merge the branch."*  
@@ -155,7 +159,11 @@ coord dispatch "Add healthcheck endpoint" --auto-merge
 # 7. Check active coordinator worktrees, non-git workspaces, and GPU status
 coord status
 
-# 8. Clean up finished worktrees
+# 8. Live-tail agy output in real-time (costs 0 LLM tokens)
+coord logs -f
+coord logs agy-12345 -n 50
+
+# 9. Clean up finished worktrees
 coord clean
 ```
 

@@ -149,6 +149,28 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
             },
         },
         {
+            "name": "coord_logs",
+            "description": "Watch live progress and inspect the recent log tail of an active or recent agy task (costs 0 LLM tokens).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "Specific task ID to tail (optional; defaults to the most recent run).",
+                    },
+                    "lines": {
+                        "type": "integer",
+                        "description": "Number of recent log lines to view (default 25).",
+                        "default": 25,
+                    },
+                    "project_path": {
+                        "type": "string",
+                        "description": "Path to the project repository.",
+                    },
+                },
+            },
+        },
+        {
             "name": "coord_plan",
             "description": "Divide a high-level goal into a multi-agent plan with Claude as Watcher/Architect/Implementer and Agy as Implementer/Reporter.",
             "inputSchema": {
@@ -320,6 +342,22 @@ Updated report saved at: .coordinator/reports/{report.task_id}_report.md
             for app in compute_apps:
                 lines.append(f"  * PID {app['pid']} ({app['process_name']}): {app['used_mb']:.0f}MB VRAM")
             return {"content": [{"type": "text", "text": "\n".join(lines)}]}
+
+        elif name == "coord_logs":
+            task_id = arguments.get("task_id")
+            num_lines = arguments.get("lines", 25)
+            log_info = orch.get_live_logs(task_id=task_id, lines=num_lines)
+            if not log_info.get("found"):
+                return {"content": [{"type": "text", "text": log_info.get("message", "No active or recent logs found.")]}
+            tail_text = "\n".join(log_info.get("tail", []))
+            res_text = f"""📄 Log: {log_info.get('log_file')}
+Last updated: {log_info.get('modified_seconds_ago', 0):.1f}s ago | Total lines: {log_info.get('total_lines')}
+
+Recent Output:
+```text
+{tail_text}
+```"""
+            return {"content": [{"type": "text", "text": res_text}]}
 
         elif name == "coord_status":
             is_init = is_repo_initialized(project_path)
