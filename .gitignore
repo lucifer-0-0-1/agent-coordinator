@@ -1,0 +1,5 @@
+# Agent Coordinator artifacts
+.coordinator/
+.worktrees/
+TASK_REPORT.json
+*.agent-log
