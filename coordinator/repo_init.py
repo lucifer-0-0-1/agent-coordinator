@@ -12,14 +12,33 @@ from coordinator.templates import (
 )
 
 
-def ensure_git_repo(repo_path: Path, auto_init: bool = True) -> bool:
-    """Ensure repo_path is a git repository."""
-    git_dir = repo_path / ".git"
+def is_git_repo(path: Path) -> bool:
+    """Return True if path is inside a Git repository."""
+    git_dir = path / ".git"
     if git_dir.exists():
         return True
+    try:
+        res = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=str(path),
+            capture_output=True,
+            text=True,
+        )
+        return res.returncode == 0 and res.stdout.strip() == "true"
+    except Exception:
+        return False
+
+
+def ensure_git_repo(repo_path: Path, auto_init: bool = True) -> bool:
+    """Ensure repo_path is a git repository if auto_init is True."""
+    if is_git_repo(repo_path):
+        return True
     if auto_init:
-        res = subprocess.run(["git", "init"], cwd=str(repo_path), capture_output=True, text=True)
-        return res.returncode == 0
+        try:
+            res = subprocess.run(["git", "init"], cwd=str(repo_path), capture_output=True, text=True)
+            return res.returncode == 0
+        except Exception:
+            return False
     return False
 
 
@@ -44,14 +63,16 @@ def ensure_gitignore(repo_path: Path) -> str:
     if not missing_entries:
         return "verified"
 
-    with open(gitignore_path, "a", encoding="utf-8") as f:
-        if existing_lines and existing_lines[-1].strip() != "":
-            f.write("\n")
-        f.write("# Agent Coordinator artifacts\n")
-        for entry in missing_entries:
-            f.write(f"{entry}\n")
-
-    return "updated" if existing_lines else "created"
+    try:
+        with open(gitignore_path, "a", encoding="utf-8") as f:
+            if existing_lines and existing_lines[-1].strip() != "":
+                f.write("\n")
+            f.write("# Agent Coordinator artifacts\n")
+            for entry in missing_entries:
+                f.write(f"{entry}\n")
+        return "updated" if existing_lines else "created"
+    except Exception:
+        return "skipped"
 
 
 def ensure_repo_instructions(
@@ -62,11 +83,12 @@ def ensure_repo_instructions(
 ) -> Dict[str, str]:
     """
     Auto-create and verify all necessary repository instruction files.
+    Works seamlessly for both Git repositories and non-Git directories.
     Ensures:
       - AGENTS.md (Root shared guidelines)
       - CLAUDE.md (Claude watcher/implementer guidelines)
       - .agents/AGENTS.md (Antigravity implementer/reporter guidelines)
-      - .gitignore entries for worktrees
+      - .gitignore entries (if git is used or present)
       - Optional docs/ARCHITECTURE.md
     """
     repo_path = repo_path.resolve()
@@ -74,7 +96,7 @@ def ensure_repo_instructions(
 
     # Check git repository
     is_git = ensure_git_repo(repo_path, auto_init=auto_git_init)
-    results["git"] = "initialized" if is_git else "skipped"
+    results["git"] = "initialized" if is_git else "skipped (non-git)"
 
     # 1. AGENTS.md (Root)
     agents_root = repo_path / "AGENTS.md"

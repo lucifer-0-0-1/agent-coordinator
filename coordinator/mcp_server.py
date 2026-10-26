@@ -6,9 +6,10 @@ import logging
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
-from coordinator.repo_init import ensure_repo_instructions, is_repo_initialized
+from coordinator.repo_init import ensure_repo_instructions, is_repo_initialized, is_git_repo
 from coordinator.orchestrator import CoordinatorOrchestrator
 from coordinator.schema import AgentType, TaskStatus, TaskReport, Task, TaskPlan
+from coordinator.resource import get_gpu_status
 
 
 def get_tool_definitions() -> List[Dict[str, Any]]:
@@ -16,7 +17,7 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
     return [
         {
             "name": "coord_init",
-            "description": "Auto-scaffold or verify repository instruction files (AGENTS.md, CLAUDE.md, .agents/AGENTS.md, .gitignore) to enable dual-harness coordination.",
+            "description": "Auto-scaffold or verify repository instruction files (AGENTS.md, CLAUDE.md, .agents/AGENTS.md, .gitignore) to enable dual-harness coordination in Git or non-Git projects.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -34,12 +35,17 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
                         "description": "Also scaffold docs/ARCHITECTURE.md if true.",
                         "default": False,
                     },
+                    "non_git": {
+                        "type": "boolean",
+                        "description": "Do not run git init if project is not a git repository.",
+                        "default": False,
+                    },
                 },
             },
         },
         {
             "name": "coord_dispatch",
-            "description": "Dispatch an implementation task to Antigravity (agy) in an isolated Git worktree. The active working directory, unstaged edits, and Git index of Claude are completely undisturbed.",
+            "description": "Dispatch an implementation task to Antigravity (agy). Runs in an isolated Git worktree or directory workspace without touching Claude's active working tree. Supports long-running tasks without 30-min timeout and optional GPU gating.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -61,10 +67,30 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
                         "type": "string",
                         "description": "Custom branch name for the task worktree (defaults to agent/agy/<task_id>).",
                     },
+                    "use_worktree": {
+                        "type": "boolean",
+                        "description": "Use an isolated Git worktree/workspace. Set to false for direct in-place execution.",
+                        "default": True,
+                    },
                     "auto_merge": {
                         "type": "boolean",
                         "description": "Auto-merge the task branch into the current branch if tests pass.",
                         "default": False,
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Execution timeout in seconds. 0 = no timeout (unlimited, no cutoff). Default is 0.",
+                        "default": 0,
+                    },
+                    "wait_gpu": {
+                        "type": "boolean",
+                        "description": "Wait until GPU VRAM is free before starting task execution.",
+                        "default": False,
+                    },
+                    "gpu_min_free": {
+                        "type": "integer",
+                        "description": "Minimum free GPU VRAM in MB required when wait_gpu is true (default 1500).",
+                        "default": 1500,
                     },
                     "project_path": {
                         "type": "string",
@@ -75,8 +101,35 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
             },
         },
         {
+            "name": "coord_guide",
+            "description": "As the Watcher (Claude Code), guide agy on an existing task with review comments or fix instructions. Agy addresses the feedback in the existing workspace and updates the report.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task ID previously dispatched (e.g. agy-12345).",
+                    },
+                    "feedback": {
+                        "type": "string",
+                        "description": "Specific guidance, review comments, failing test details, or required code fixes.",
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Timeout in seconds (0 = unlimited).",
+                        "default": 0,
+                    },
+                    "project_path": {
+                        "type": "string",
+                        "description": "Path to the project repository.",
+                    },
+                },
+                "required": ["task_id", "feedback"],
+            },
+        },
+        {
             "name": "coord_status",
-            "description": "Inspect active coordinator worktrees, recent completion reports, and repository instruction readiness.",
+            "description": "Inspect active coordinator worktrees, recent completion reports, GPU availability, and repository instruction readiness.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -85,6 +138,14 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
                         "description": "Path to the project repository.",
                     },
                 },
+            },
+        },
+        {
+            "name": "coord_gpu_status",
+            "description": "Check current NVIDIA GPU availability, free VRAM, and active compute processes (costs 0 LLM tokens).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
             },
         },
         {
@@ -172,13 +233,15 @@ class MCPServer:
 
     def handle_call_tool(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         project_path = Path(arguments.get("project_path") or ".").resolve()
-        orch = CoordinatorOrchestrator(project_path)
+        auto_git = not arguments.get("non_git", False)
+        orch = CoordinatorOrchestrator(project_path, auto_git_init=auto_git)
 
         if name == "coord_init":
             results = ensure_repo_instructions(
                 project_path,
                 force=arguments.get("force", False),
                 create_arch=arguments.get("create_arch", False),
+                auto_git_init=auto_git,
             )
             text_lines = [f"Repository instructions for {project_path}:"]
             for f, status in results.items():
@@ -190,7 +253,12 @@ class MCPServer:
             files = arguments.get("files", [])
             criteria = arguments.get("criteria", [])
             branch = arguments.get("branch_name")
+            use_worktree = arguments.get("use_worktree", True)
             auto_merge = arguments.get("auto_merge", False)
+            raw_timeout = arguments.get("timeout", 0)
+            timeout = None if raw_timeout == 0 else raw_timeout
+            wait_gpu = arguments.get("wait_gpu", False)
+            min_gpu_free = arguments.get("gpu_min_free", 1500)
 
             report = orch.dispatch_agy(
                 title=task_desc[:80],
@@ -198,14 +266,18 @@ class MCPServer:
                 files=files,
                 criteria=criteria,
                 branch_name=branch,
+                use_worktree=use_worktree,
                 auto_merge=auto_merge,
+                timeout=timeout,
+                wait_gpu=wait_gpu,
+                min_gpu_free_mb=min_gpu_free,
             )
 
             status_icon = "✅" if report.status == TaskStatus.COMPLETED else "❌"
-            res_text = f"""{status_icon} Task {report.task_id} completed with status: {report.status.value.upper()}
+            res_text = f"""{status_icon} Task {report.task_id} finished with status: {report.status.value.upper()}
 Summary: {report.summary}
 Duration: {report.duration_seconds:.1f}s
-Git Commit: {report.git_commit or 'None'}
+Git Commit: {report.git_commit or 'None (or non-git)'}
 Tests Passed: {report.tests_passed}
 Modified Files: {', '.join(report.files_modified) if report.files_modified else 'None'}
 Created Files: {', '.join(report.files_created) if report.files_created else 'None'}
@@ -217,19 +289,61 @@ Report saved at: .coordinator/reports/{report.task_id}_report.md
 """
             return {"content": [{"type": "text", "text": res_text}]}
 
+        elif name == "coord_guide":
+            task_id = arguments["task_id"]
+            feedback = arguments["feedback"]
+            raw_timeout = arguments.get("timeout", 0)
+            timeout = None if raw_timeout == 0 else raw_timeout
+
+            report = orch.guide_agy(task_id=task_id, feedback=feedback, timeout=timeout)
+            status_icon = "✅" if report.status == TaskStatus.COMPLETED else "❌"
+            res_text = f"""{status_icon} Guidance iteration on {task_id} finished: {report.status.value.upper()}
+Summary: {report.summary}
+Duration: {report.duration_seconds:.1f}s
+Tests Passed: {report.tests_passed}
+Updated Diffstat:
+{report.diff_stat or 'No diff recorded'}
+
+Updated report saved at: .coordinator/reports/{report.task_id}_report.md
+"""
+            return {"content": [{"type": "text", "text": res_text}]}
+
+        elif name == "coord_gpu_status":
+            stat = get_gpu_status()
+            if not stat.get("available"):
+                return {"content": [{"type": "text", "text": "No NVIDIA GPU detected or nvidia-smi unavailable."}]}
+            lines = ["NVIDIA GPU Status:"]
+            for g in stat.get("gpus", []):
+                lines.append(f"- GPU {g['index']} ({g['name']}): {g['free_mb']:.0f}MB free / {g['total_mb']:.0f}MB total ({g['utilization_pct']:.0f}% util)")
+            compute_apps = stat.get("compute_apps", [])
+            lines.append(f"- Active Compute Processes: {len(compute_apps)}")
+            for app in compute_apps:
+                lines.append(f"  * PID {app['pid']} ({app['process_name']}): {app['used_mb']:.0f}MB VRAM")
+            return {"content": [{"type": "text", "text": "\n".join(lines)}]}
+
         elif name == "coord_status":
             is_init = is_repo_initialized(project_path)
+            is_git = is_git_repo(project_path)
             worktrees = orch.worktree_mgr.list_worktrees()
-            coord_wts = [w for w in worktrees if ".coordinator/worktrees" in w.get("path", "")]
+            coord_wts = [w for w in worktrees if ".coordinator/" in w.get("path", "")]
             reports = list(orch.reports_dir.glob("*_report.json"))
+
+            # GPU status line
+            gpu_line = "GPU: None"
+            gpu_stat = get_gpu_status()
+            if gpu_stat.get("available") and gpu_stat.get("gpus"):
+                g0 = gpu_stat["gpus"][0]
+                gpu_line = f"GPU: {g0['name']} ({g0['free_mb']:.0f}MB free, {len(gpu_stat.get('compute_apps', []))} apps)"
 
             res_lines = [
                 f"Coordinator Status for: {project_path}",
                 f"- Repository instructions initialized: {'Yes' if is_init else 'No'}",
-                f"- Active coordinator worktrees: {len(coord_wts)}",
+                f"- Git repository: {'Yes' if is_git else 'No (directory mode)'}",
+                f"- {gpu_line}",
+                f"- Active coordinator workspaces: {len(coord_wts)}",
             ]
             for wt in coord_wts:
-                res_lines.append(f"  * Branch: {wt.get('branch', 'unknown')} (Path: {wt.get('path')})")
+                res_lines.append(f"  * Identifier: {wt.get('branch', 'unknown')} (Path: {wt.get('path')})")
 
             res_lines.append(f"- Recent task reports: {len(reports)}")
             for r in sorted(reports, key=lambda p: p.stat().st_mtime, reverse=True)[:5]:
@@ -288,7 +402,7 @@ Report saved at: .coordinator/reports/{report.task_id}_report.md
 
         elif name == "coord_clean":
             count = orch.cleanup_all_worktrees()
-            return {"content": [{"type": "text", "text": f"Cleaned up {count} coordinator worktrees."}]}
+            return {"content": [{"type": "text", "text": f"Cleaned up {count} coordinator workspaces."}]}
 
         return {"content": [{"type": "text", "text": f"Unknown tool: {name}"}], "isError": True}
 
@@ -315,7 +429,7 @@ Report saved at: .coordinator/reports/{report.task_id}_report.md
                     "result": {
                         "protocolVersion": "2024-11-05",
                         "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "agent-coordinator", "version": "0.1.0"},
+                        "serverInfo": {"name": "agent-coordinator", "version": "0.2.0"},
                     },
                 }
             elif method == "notifications/initialized":

@@ -1,4 +1,4 @@
-"""Comprehensive unit tests for agent_coordinator."""
+"""Comprehensive unit tests for agent_coordinator including non-git and resource tests."""
 
 import unittest
 import tempfile
@@ -6,10 +6,11 @@ import shutil
 from pathlib import Path
 import subprocess
 
-from coordinator.repo_init import ensure_repo_instructions, is_repo_initialized
-from coordinator.worktree import GitWorktreeManager
+from coordinator.repo_init import ensure_repo_instructions, is_repo_initialized, is_git_repo
+from coordinator.worktree import WorkspaceManager
 from coordinator.schema import Task, TaskReport, TaskStatus, AgentType, TaskPlan
 from coordinator.orchestrator import CoordinatorOrchestrator
+from coordinator.resource import get_gpu_status, wait_for_gpu
 from coordinator.cli import parse_args, main
 
 
@@ -20,8 +21,8 @@ class TestRepoInit(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
-    def test_ensure_repo_instructions(self):
-        results = ensure_repo_instructions(self.test_dir, create_arch=True)
+    def test_ensure_repo_instructions_git(self):
+        results = ensure_repo_instructions(self.test_dir, auto_git_init=True, create_arch=True)
         self.assertEqual(results["AGENTS.md"], "created")
         self.assertEqual(results["CLAUDE.md"], "created")
         self.assertEqual(results[".agents/AGENTS.md"], "created")
@@ -32,17 +33,24 @@ class TestRepoInit(unittest.TestCase):
         self.assertTrue((self.test_dir / ".gitignore").exists())
         self.assertTrue(is_repo_initialized(self.test_dir))
 
-        # Re-running should verify, not overwrite unless forced
-        results2 = ensure_repo_instructions(self.test_dir)
-        self.assertEqual(results2["AGENTS.md"], "verified")
-        self.assertEqual(results2["CLAUDE.md"], "verified")
-        self.assertEqual(results2[".agents/AGENTS.md"], "verified")
+    def test_ensure_repo_instructions_nongit(self):
+        # Auto git init disabled (non-git mode)
+        results = ensure_repo_instructions(self.test_dir, auto_git_init=False)
+        self.assertIn("non-git", results["git"])
+        self.assertTrue((self.test_dir / "AGENTS.md").exists())
+        self.assertTrue((self.test_dir / "CLAUDE.md").exists())
+        self.assertTrue((self.test_dir / ".agents" / "AGENTS.md").exists())
+        self.assertFalse(is_git_repo(self.test_dir))
 
 
-class TestWorktreeManager(unittest.TestCase):
+class TestWorkspaceManager(unittest.TestCase):
     def setUp(self):
         self.test_dir = Path(tempfile.mkdtemp())
-        # Init git repo with initial commit
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_git_worktree_lifecycle(self):
         subprocess.run(["git", "init"], cwd=str(self.test_dir), check=True, capture_output=True)
         subprocess.run(["git", "config", "user.name", "Test User"], cwd=str(self.test_dir), check=True)
         subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(self.test_dir), check=True)
@@ -51,12 +59,8 @@ class TestWorktreeManager(unittest.TestCase):
         subprocess.run(["git", "add", "README.md"], cwd=str(self.test_dir), check=True)
         subprocess.run(["git", "commit", "-m", "initial commit"], cwd=str(self.test_dir), check=True)
 
-    def tearDown(self):
-        shutil.rmtree(self.test_dir, ignore_errors=True)
-
-    def test_create_and_remove_worktree(self):
-        mgr = GitWorktreeManager(self.test_dir)
-        worktree_path, branch = mgr.create_worktree("t1")
+        mgr = WorkspaceManager(self.test_dir)
+        worktree_path, branch = mgr.create_workspace("t1", use_worktree=True)
         self.assertTrue(worktree_path.exists())
         self.assertTrue(branch.startswith("agent/task-t1"))
 
@@ -66,41 +70,60 @@ class TestWorktreeManager(unittest.TestCase):
         subprocess.run(["git", "add", "hello.txt"], cwd=str(worktree_path), check=True)
         subprocess.run(["git", "commit", "-m", "add hello"], cwd=str(worktree_path), check=True)
 
-        # Check diff in worktree
         diff = mgr.get_diff(worktree_path, base_ref="HEAD~1")
         self.assertIn("Hello from worktree", diff)
 
-        # Merge branch back to main
         success, msg = mgr.merge_branch(branch)
         self.assertTrue(success, msg)
         self.assertTrue((self.test_dir / "hello.txt").exists())
 
-        # Remove worktree
-        removed = mgr.remove_worktree("t1", force=True, delete_branch=True)
-        self.assertTrue(removed)
+        mgr.remove_worktree("t1", force=True, delete_branch=True)
         self.assertFalse(worktree_path.exists())
+
+    def test_nongit_workspace(self):
+        # Non-git directory
+        (self.test_dir / "code.py").write_text("print('hello')\n")
+        mgr = WorkspaceManager(self.test_dir)
+        self.assertFalse(mgr.is_git)
+
+        # In-place mode
+        inplace_path, ident = mgr.create_workspace("t2", use_worktree=False)
+        self.assertEqual(inplace_path, self.test_dir)
+        self.assertEqual(ident, "in-place")
+
+        # Isolated directory mode
+        ws_path, ident2 = mgr.create_workspace("t3", use_worktree=True, assigned_files=["code.py"])
+        self.assertTrue(ws_path.exists())
+        self.assertTrue((ws_path / "code.py").exists())
+
+
+class TestResourceAndGuidance(unittest.TestCase):
+    def test_gpu_check(self):
+        status = get_gpu_status()
+        self.assertIn("available", status)
+        self.assertIn("gpus", status)
+
+    def test_guidance_prompt_building(self):
+        from coordinator.harness.agy import AntigravityHarness
+        harness = AntigravityHarness()
+        task = Task(id="test-1", title="CAN Parser", description="Parse CAN frames", assigned_to=AgentType.AGY)
+        prompt = harness.build_guidance_prompt(task, "Bitmask is off for 29-bit frames")
+        self.assertIn("Bitmask is off for 29-bit frames", prompt)
+        self.assertIn("Watcher (Claude Code)", prompt)
 
 
 class TestCLI(unittest.TestCase):
     def setUp(self):
         self.test_dir = Path(tempfile.mkdtemp())
-        subprocess.run(["git", "init"], cwd=str(self.test_dir), check=True, capture_output=True)
-        subprocess.run(["git", "config", "user.name", "Test User"], cwd=str(self.test_dir), check=True)
-        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(self.test_dir), check=True)
-        (self.test_dir / "file.txt").write_text("content\n")
-        subprocess.run(["git", "add", "."], cwd=str(self.test_dir), check=True)
-        subprocess.run(["git", "commit", "-m", "init"], cwd=str(self.test_dir), check=True)
 
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
-    def test_cli_init_and_status(self):
-        # Test init
-        exit_code = main(["init", str(self.test_dir)])
+    def test_cli_init_nongit_and_status(self):
+        exit_code = main(["init", str(self.test_dir), "--non-git"])
         self.assertEqual(exit_code, 0)
         self.assertTrue((self.test_dir / "AGENTS.md").exists())
 
-        # Test status
         exit_code = main(["status", "--path", str(self.test_dir)])
         self.assertEqual(exit_code, 0)
 

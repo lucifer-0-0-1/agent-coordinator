@@ -92,9 +92,15 @@ The coordinator is registered as a native MCP server (`coordinator`) connected t
   > *"What's the status of running coordinator tasks?"*  
   *(Claude calls `coord_status` to view active worktrees and recent reports)*
 
-- **Review and merge**:
+- **Review, Guide, and Merge**:
   > *"Inspect agy's report, verify tests, and merge the branch."*  
   *(Claude reviews the diff and calls `coord_merge`)*
+  > *"The CAN parser fails edge cases for 29-bit frames; guide agy to fix the bitmask in `src/can/parser.c`."*  
+  *(Claude calls `coord_guide` to pass targeted review comments; agy fixes the issue in the existing workspace without Claude having to rewrite the code)*
+
+- **GPU Resource Gating**:
+  > *"Dispatch the VGGT evaluation task to agy with GPU gating."*  
+  *(Claude calls `coord_dispatch` with `wait_gpu=True`; the coordinator queries nvidia-smi and waits until VRAM is free before launching)*
 
 ---
 
@@ -125,24 +131,31 @@ The coordinator is also registered as an MCP server and Skill in Antigravity:
 Both `coord` and `agent-coordinator` are available in your system `$PATH`:
 
 ```bash
-# 1. Initialize repository instruction files
-coord init /path/to/project
+# 1. Initialize instruction files (supports Git and non-Git folders)
+coord init /path/to/project [--non-git]
 
-# 2. Dispatch a task to agy in an isolated worktree
+# 2. Dispatch a task to agy without timeout (0 = unlimited, default no timeout)
 coord dispatch "Implement CAN frame parser" \
     --files "src/can/parser.c,tests/test_parser.py" \
-    --criteria "pytest tests/test_parser.py must pass"
+    --criteria "pytest tests/test_parser.py must pass" \
+    --timeout 0
 
-# 3. Dispatch with auto-merge if tests pass
+# 3. Dispatch for GPU tasks (waits until GPU is free before starting)
+coord dispatch "Run VGGT evaluation" --wait-gpu --gpu-min-free 2000 --timeout 0
+
+# 4. In-place / non-worktree mode (for remote-host tasks or directory scripts)
+coord dispatch "Run evaluation on remote host" --no-worktree --timeout 0
+
+# 5. Guide agy with Watcher feedback (Watcher -> Implementer iteration loop)
+coord guide agy-12345 "The bitmask fails for 29-bit frames; fix in src/can/parser.c"
+
+# 6. Dispatch with auto-merge if tests pass
 coord dispatch "Add healthcheck endpoint" --auto-merge
 
-# 4. Run a single-agent task directly
-coord run "Refactor database models" --agent agy
-
-# 5. Check active coordinator worktrees and reports
+# 7. Check active coordinator worktrees, non-git workspaces, and GPU status
 coord status
 
-# 6. Clean up finished worktrees
+# 8. Clean up finished worktrees
 coord clean
 ```
 
@@ -212,11 +225,12 @@ When running `coord init` or any coordinator dispatch, the following files are a
 
 | Command | Arguments / Flags | Description |
 |---|---|---|
-| `coord init [path]` | `--force`, `--arch` | Auto-scaffold or verify `AGENTS.md`, `CLAUDE.md`, `.agents/AGENTS.md`, and `.gitignore`. |
-| `coord dispatch "<task>"` | `--agent agy\|claude`<br>`--files "f1,f2"`<br>`--criteria "c1,c2"`<br>`--branch "<name>"`<br>`--auto-merge` | Fast background dispatch to an isolated Git worktree; returns structured completion report and diffstat. |
-| `coord run "<prompt>"` | `--mode single\|multi`<br>`--agent agy\|claude`<br>`--no-worktree`<br>`--auto-merge` | Run a single-agent or multi-agent task. |
-| `coord status` | `--path [dir]` | Display active worktrees, repo initialization health, and recent task reports. |
-| `coord clean` | `--path [dir]` | Remove completed coordinator worktrees and prune metadata. |
+| `coord init [path]` | `--force`, `--arch`, `--non-git` | Auto-scaffold or verify `AGENTS.md`, `CLAUDE.md`, `.agents/AGENTS.md`, and `.gitignore` in Git or non-Git projects. |
+| `coord dispatch "<task>"` | `--agent agy\|claude`<br>`--files "f1,f2"`<br>`--criteria "c1,c2"`<br>`--branch "<name>"`<br>`--no-worktree`<br>`--auto-merge`<br>`--timeout <sec>`<br>`--wait-gpu`<br>`--gpu-min-free <mb>` | Fast background dispatch to an isolated workspace or worktree; supports unlimited runtime (0 = no timeout) and GPU resource waiting. |
+| `coord guide <task_id> "<feedback>"` | `--timeout <sec>` | Pass Watcher review comments to guide agy on an existing task, updating code and report. |
+| `coord run "<prompt>"` | `--mode single\|multi`<br>`--agent agy\|claude`<br>`--no-worktree`<br>`--auto-merge`<br>`--timeout <sec>`<br>`--wait-gpu` | Run a single-agent or multi-agent task. |
+| `coord status` | `--path [dir]` | Display active worktrees/workspaces, GPU health & VRAM, repo initialization, and recent reports. |
+| `coord clean` | `--path [dir]` | Remove completed coordinator worktrees/workspaces and prune metadata. |
 
 ---
 
@@ -224,9 +238,11 @@ When running `coord init` or any coordinator dispatch, the following files are a
 
 When using Claude Code or Antigravity, the `coordinator` MCP server exposes:
 
-- **`coord_init(project_path, force, create_arch)`**: Scaffolds instruction files.
-- **`coord_dispatch(task, files, criteria, branch_name, auto_merge, project_path)`**: Runs task in isolated worktree.
-- **`coord_status(project_path)`**: Lists active worktrees and reports.
+- **`coord_init(project_path, force, create_arch, non_git)`**: Scaffolds instruction files.
+- **`coord_dispatch(task, files, criteria, branch_name, use_worktree, auto_merge, timeout, wait_gpu, gpu_min_free, project_path)`**: Runs task in isolated worktree or in-place without timeout.
+- **`coord_guide(task_id, feedback, timeout, project_path)`**: Watcher passes review comments to guide agy on an existing task.
+- **`coord_gpu_status()`**: Checks GPU name, free VRAM, utilization, and running compute processes (0 LLM tokens).
+- **`coord_status(project_path)`**: Lists active workspaces, GPU status, and reports.
 - **`coord_plan(goal, tasks, project_path)`**: Saves multi-agent task breakdown.
 - **`coord_merge(branch_name, into_branch, task_id, project_path)`**: Integrates branch and cleans up worktree.
 - **`coord_clean(project_path)`**: Cleans up all coordinator worktrees.

@@ -1,10 +1,11 @@
-"""Main Coordinator Orchestrator for managing single and multi-agent runs."""
+"""Main Coordinator Orchestrator for managing single and multi-agent runs.
+Handles Git worktrees, non-Git workspaces, GPU resource gating, and the Watcher-Implementer guidance loop.
+"""
 
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Union
 import json
 import time
-import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from coordinator.schema import (
@@ -15,17 +16,19 @@ from coordinator.schema import (
     AgentType,
     ExecutionMode,
 )
-from coordinator.repo_init import ensure_repo_instructions
-from coordinator.worktree import GitWorktreeManager
+from coordinator.repo_init import ensure_repo_instructions, is_git_repo, is_repo_initialized
+from coordinator.worktree import WorkspaceManager
 from coordinator.harness.agy import AntigravityHarness
 from coordinator.harness.claude import ClaudeHarness
+from coordinator.resource import get_gpu_status
 
 
 class CoordinatorOrchestrator:
-    """Coordinates execution across Claude Code and Antigravity (agy)."""
+    """Coordinates execution across Claude Code (Watcher/Guide) and Antigravity (Implementer/Reporter)."""
 
-    def __init__(self, repo_path: Union[str, Path]):
+    def __init__(self, repo_path: Union[str, Path], auto_git_init: bool = False):
         self.repo_path = Path(repo_path).resolve()
+        self.is_git = is_git_repo(self.repo_path)
         self.coord_dir = self.repo_path / ".coordinator"
         self.coord_dir.mkdir(parents=True, exist_ok=True)
         self.reports_dir = self.coord_dir / "reports"
@@ -33,10 +36,11 @@ class CoordinatorOrchestrator:
         self.state_file = self.coord_dir / "state.json"
 
         # 1. Automatically ensure repository instructions exist on every run
-        self.init_results = ensure_repo_instructions(self.repo_path)
+        # For non-git directories, auto_git_init=False respects non-git status
+        self.init_results = ensure_repo_instructions(self.repo_path, auto_git_init=auto_git_init)
 
-        # 2. Worktree & Harnesses
-        self.worktree_mgr = GitWorktreeManager(self.repo_path)
+        # 2. Workspace Manager & Harnesses
+        self.worktree_mgr = WorkspaceManager(self.repo_path)
         self.agy_harness = AntigravityHarness()
         self.claude_harness = ClaudeHarness()
 
@@ -69,7 +73,7 @@ class CoordinatorOrchestrator:
 ## Tests Executed
 {chr(10).join(f'- {t}' for t in report.tests_run) if report.tests_run else 'None recorded'}
 
-## Git Diffstat
+## Diffstat
 ```text
 {report.diff_stat or 'No diff recorded'}
 ```
@@ -86,11 +90,18 @@ class CoordinatorOrchestrator:
         files: Optional[List[str]] = None,
         criteria: Optional[List[str]] = None,
         branch_name: Optional[str] = None,
+        use_worktree: bool = True,
         auto_merge: bool = False,
+        timeout: Optional[int] = None,  # None = no timeout (unlimited)
+        wait_gpu: bool = False,
+        min_gpu_free_mb: int = 1500,
     ) -> TaskReport:
         """
         Fast dispatch of an implementation task to Antigravity (agy).
-        Executes in an isolated worktree so Claude's active working tree is never disturbed.
+        - In Git mode with use_worktree=True: runs in an isolated git worktree.
+        - In non-Git mode (or use_worktree=False): runs in-place or snapshot workspace.
+        - timeout=None: no arbitrary 30-minute cutoff; long jobs are allowed to complete.
+        - wait_gpu=True: waits until GPU VRAM is free before launching.
         """
         task_id = f"agy-{int(time.time())}"
         task = Task(
@@ -100,24 +111,32 @@ class CoordinatorOrchestrator:
             assigned_to=AgentType.AGY,
             files=files or [],
             criteria=criteria or [],
-            branch=branch_name or f"agent/agy/{task_id}",
+            branch=branch_name or (f"agent/agy/{task_id}" if self.is_git else "in-place"),
         )
 
-        worktree_path, branch = self.worktree_mgr.create_worktree(
+        workspace_path, branch = self.worktree_mgr.create_workspace(
             task_id=task.id,
+            use_worktree=use_worktree,
             branch_name=task.branch,
+            assigned_files=task.files,
         )
-        task.worktree_path = str(worktree_path)
+        task.worktree_path = str(workspace_path)
         task.status = TaskStatus.RUNNING
 
         try:
-            report = self.agy_harness.run_task(task, worktree_path)
+            report = self.agy_harness.run_task(
+                task=task,
+                worktree_path=workspace_path,
+                timeout=timeout,
+                wait_gpu=wait_gpu,
+                min_gpu_free_mb=min_gpu_free_mb,
+            )
             task.status = report.status
             task.completed_at = time.time()
             task.report = report.to_dict()
             self._save_report(report)
 
-            if auto_merge and report.status == TaskStatus.COMPLETED:
+            if auto_merge and report.status == TaskStatus.COMPLETED and self.is_git and use_worktree:
                 merged, msg = self.worktree_mgr.merge_branch(branch)
                 report.notes.append(f"Auto-merge result: {msg}")
                 self.worktree_mgr.remove_worktree(task.id, force=True)
@@ -135,6 +154,53 @@ class CoordinatorOrchestrator:
             self._save_report(err_report)
             return err_report
 
+    def guide_agy(
+        self,
+        task_id: str,
+        feedback: str,
+        timeout: Optional[int] = None,
+    ) -> TaskReport:
+        """
+        Claude (Watcher) provides feedback to guide agy on an existing task.
+        Agy re-inspects the workspace, addresses the review comments, and updates the report.
+        """
+        # Find previous report
+        json_file = self.reports_dir / f"{task_id}_report.json"
+        previous_data = {}
+        if json_file.exists():
+            try:
+                previous_data = json.loads(json_file.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+        # Locate existing workspace or worktree
+        sanitized_id = task_id.replace("agent/task-", "").replace("agy-", "")
+        wt_candidate = self.worktree_mgr.worktrees_base / task_id
+        ws_candidate = self.worktree_mgr.workspaces_base / task_id
+        if wt_candidate.exists():
+            target_path = wt_candidate
+        elif ws_candidate.exists():
+            target_path = ws_candidate
+        else:
+            target_path = self.repo_path
+
+        task = Task(
+            id=task_id,
+            title=f"Guided iteration on {task_id}",
+            description=f"Addressing Watcher (Claude) review comments",
+            assigned_to=AgentType.AGY,
+            files=previous_data.get("files_modified", []),
+        )
+
+        report = self.agy_harness.run_task(
+            task=task,
+            worktree_path=target_path,
+            timeout=timeout,
+            guidance_feedback=feedback,
+        )
+        self._save_report(report)
+        return report
+
     def run_single(
         self,
         prompt: str,
@@ -143,6 +209,9 @@ class CoordinatorOrchestrator:
         criteria: Optional[List[str]] = None,
         use_worktree: bool = True,
         auto_merge: bool = False,
+        timeout: Optional[int] = None,
+        wait_gpu: bool = False,
+        min_gpu_free_mb: int = 1500,
     ) -> TaskReport:
         """Execute a single-agent task without disturbing other harnesses."""
         task_id = f"{agent.value}-{int(time.time())}"
@@ -155,106 +224,40 @@ class CoordinatorOrchestrator:
             criteria=criteria or [],
         )
 
-        if use_worktree:
-            worktree_path, branch = self.worktree_mgr.create_worktree(task.id)
-            task.worktree_path = str(worktree_path)
-            task.branch = branch
-        else:
-            worktree_path = self.repo_path
+        workspace_path, branch = self.worktree_mgr.create_workspace(
+            task_id=task.id,
+            use_worktree=use_worktree,
+            assigned_files=files,
+        )
+        task.worktree_path = str(workspace_path)
+        task.branch = branch
 
         if agent == AgentType.AGY:
-            report = self.agy_harness.run_task(task, worktree_path)
+            report = self.agy_harness.run_task(
+                task=task,
+                worktree_path=workspace_path,
+                timeout=timeout,
+                wait_gpu=wait_gpu,
+                min_gpu_free_mb=min_gpu_free_mb,
+            )
         else:
-            report = self.claude_harness.run_task(task, worktree_path)
+            report = self.claude_harness.run_task(task, workspace_path)
 
         self._save_report(report)
 
-        if use_worktree and auto_merge and report.status == TaskStatus.COMPLETED and task.branch:
+        if use_worktree and auto_merge and report.status == TaskStatus.COMPLETED and self.is_git and task.branch:
             self.worktree_mgr.merge_branch(task.branch)
             self.worktree_mgr.remove_worktree(task.id, force=True)
 
         return report
 
-    def run_multi(
-        self,
-        plan: TaskPlan,
-        max_workers: int = 2,
-        auto_merge: bool = False,
-    ) -> Dict[str, TaskReport]:
-        """
-        Execute a multi-agent plan.
-        Runs independent tasks in parallel across isolated worktrees.
-        """
-        self._save_state(plan)
-        reports: Dict[str, TaskReport] = {}
-        completed_task_ids = set()
-
-        tasks_by_id = {t.id: t for t in plan.tasks}
-        pending_tasks = list(plan.tasks)
-
-        while pending_tasks:
-            # Find tasks whose dependencies are satisfied
-            ready_tasks = [
-                t for t in pending_tasks
-                if all(dep in completed_task_ids for dep in t.dependencies)
-            ]
-
-            if not ready_tasks:
-                # Deadlock or circular dependency
-                break
-
-            # Execute ready tasks in parallel
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_task = {}
-                for t in ready_tasks:
-                    worktree_path, branch = self.worktree_mgr.create_worktree(t.id)
-                    t.worktree_path = str(worktree_path)
-                    t.branch = branch
-                    t.status = TaskStatus.RUNNING
-
-                    harness = self.agy_harness if t.assigned_to == AgentType.AGY else self.claude_harness
-                    future = executor.submit(harness.run_task, t, worktree_path)
-                    future_to_task[future] = t
-
-                for future in as_completed(future_to_task):
-                    t = future_to_task[future]
-                    try:
-                        report = future.result()
-                        reports[t.id] = report
-                        t.status = report.status
-                        t.completed_at = time.time()
-                        t.report = report.to_dict()
-                        self._save_report(report)
-
-                        if report.status == TaskStatus.COMPLETED:
-                            completed_task_ids.add(t.id)
-                            if auto_merge and t.branch:
-                                self.worktree_mgr.merge_branch(t.branch)
-                                self.worktree_mgr.remove_worktree(t.id, force=True)
-                    except Exception as exc:
-                        t.status = TaskStatus.FAILED
-                        err_rep = TaskReport(
-                            task_id=t.id,
-                            agent=t.assigned_to,
-                            status=TaskStatus.FAILED,
-                            summary=f"Exception: {str(exc)}",
-                        )
-                        reports[t.id] = err_rep
-                        self._save_report(err_rep)
-
-            # Remove finished tasks from pending
-            pending_tasks = [t for t in pending_tasks if t not in ready_tasks]
-            self._save_state(plan)
-
-        return reports
-
     def cleanup_all_worktrees(self) -> int:
-        """Clean up all coordinator worktrees."""
+        """Clean up all coordinator worktrees and temporary workspaces."""
         count = 0
         worktrees = self.worktree_mgr.list_worktrees()
         for wt in worktrees:
             path_str = wt.get("path", "")
-            if ".coordinator/worktrees" in path_str:
+            if ".coordinator/worktrees" in path_str or ".coordinator/workspaces" in path_str:
                 task_id = Path(path_str).name
                 self.worktree_mgr.remove_worktree(task_id, force=True)
                 count += 1

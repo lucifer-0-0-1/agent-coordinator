@@ -1,14 +1,18 @@
-"""Antigravity (agy) CLI execution harness."""
+"""Antigravity (agy) CLI execution harness.
+Supports long-running tasks without arbitrary timeouts, GPU resource gating, and guided iterations.
+"""
 
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Callable
 import subprocess
 import json
 import time
 import shutil
+import os
 
 from coordinator.harness.base import BaseHarness
 from coordinator.schema import Task, TaskReport, TaskStatus, AgentType
+from coordinator.resource import wait_for_gpu, is_nvidia_gpu_available
 
 
 class AntigravityHarness(BaseHarness):
@@ -21,12 +25,14 @@ class AntigravityHarness(BaseHarness):
         mode: str = "accept-edits",
         skip_permissions: bool = True,
         agy_bin: Optional[str] = None,
+        default_timeout: Optional[int] = None,  # None = no timeout (unlimited)
     ):
         self.model = model
         self.effort = effort
         self.mode = mode
         self.skip_permissions = skip_permissions
         self.agy_bin = agy_bin or self._find_agy()
+        self.default_timeout = default_timeout
 
     def _find_agy(self) -> str:
         """Locate agy executable."""
@@ -63,7 +69,7 @@ Instructions:
 3. Implement the requested functionality or fix.
 4. Add or update targeted unit tests covering your changes.
 5. Run the relevant test suite to ensure green checks.
-6. Commit your changes cleanly on your task branch with an imperative message.
+6. Commit your changes cleanly on your task branch with an imperative message (if in a Git repo).
 7. MANDATORY COMPLETION REPORT:
    Before finishing, write a valid JSON file named TASK_REPORT.json in your current working directory with the following structure:
    {{
@@ -81,14 +87,78 @@ Do not modify files outside your assigned scope. Start now.
 """
         return prompt.strip()
 
-    def run_task(self, task: Task, worktree_path: Path) -> TaskReport:
-        """Run the task inside the given worktree using agy."""
+    def build_guidance_prompt(self, task: Task, feedback: str) -> str:
+        """Construct a prompt for a guided follow-up iteration from Claude Code."""
+        files_str = "\n".join(f"- {f}" for f in task.files) if task.files else "Assigned task files."
+        criteria_str = "\n".join(f"- {c}" for c in task.criteria) if task.criteria else "Verify all checks pass."
+
+        prompt = f"""You are the autonomous implementation and reporting agent.
+
+Follow-up on Task ID: {task.id} ({task.title})
+
+The Watcher (Claude Code) has inspected your previous implementation/report and provided this feedback:
+--------------------------------------------------
+{feedback}
+--------------------------------------------------
+
+Assigned Scope:
+{files_str}
+
+Criteria:
+{criteria_str}
+
+Instructions:
+1. Inspect the existing code in this workspace.
+2. Address the Watcher's feedback directly. Do NOT re-implement unrelated parts.
+3. Re-run the relevant test suite to confirm the fix.
+4. Update the TASK_REPORT.json file in your working directory with updated status, tests, and summary.
+5. If in a Git repo, commit your changes with an imperative commit message (e.g. `fix: address review feedback`).
+
+Start fixing now.
+"""
+        return prompt.strip()
+
+    def run_task(
+        self,
+        task: Task,
+        worktree_path: Path,
+        timeout: Optional[int] = None,
+        wait_gpu: bool = False,
+        min_gpu_free_mb: int = 1500,
+        guidance_feedback: Optional[str] = None,
+        log_callback: Optional[Callable[[str], None]] = None,
+    ) -> TaskReport:
+        """
+        Run the task inside the given worktree/workspace using agy.
+        - timeout=None or 0: runs indefinitely without cutoff.
+        - wait_gpu=True: waits until the GPU is free before starting.
+        """
         start_time = time.time()
         log_dir = worktree_path / ".coordinator" / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = log_dir / f"agy_{task.id}_{int(start_time)}.log"
 
-        prompt = self.build_task_prompt(task)
+        def _log(msg: str):
+            if log_callback:
+                log_callback(msg)
+            with open(log_file, "a", encoding="utf-8") as lf:
+                lf.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+                lf.flush()
+
+        # 1. Wait for GPU if requested
+        if wait_gpu:
+            _log(f"Checking GPU readiness (min {min_gpu_free_mb}MB free required)...")
+            wait_for_gpu(
+                min_free_mb=min_gpu_free_mb,
+                poll_interval=10,
+                log_fn=_log,
+            )
+
+        # 2. Build prompt
+        if guidance_feedback:
+            prompt = self.build_guidance_prompt(task, guidance_feedback)
+        else:
+            prompt = self.build_task_prompt(task)
 
         cmd = [
             self.agy_bin,
@@ -105,12 +175,17 @@ Do not modify files outside your assigned scope. Start now.
         if self.skip_permissions:
             cmd.append("--dangerously-skip-permissions")
 
-        with open(log_file, "w", encoding="utf-8") as lf:
-            lf.write(f"=== AGY EXECUTION START FOR TASK {task.id} ===\n")
-            lf.write(f"Command: {' '.join(cmd)}\n")
-            lf.write(f"Worktree: {worktree_path}\n\n")
-            lf.flush()
+        effective_timeout = timeout if timeout is not None else self.default_timeout
+        # 0 or None means no timeout
+        if effective_timeout == 0:
+            effective_timeout = None
 
+        _log(f"=== AGY EXECUTION START FOR TASK {task.id} ===")
+        _log(f"Command: {' '.join(cmd)}")
+        _log(f"Working Directory: {worktree_path}")
+        _log(f"Timeout: {'unlimited (no cutoff)' if effective_timeout is None else f'{effective_timeout}s'}")
+
+        with open(log_file, "a", encoding="utf-8") as lf:
             try:
                 proc = subprocess.run(
                     cmd,
@@ -118,17 +193,18 @@ Do not modify files outside your assigned scope. Start now.
                     stdout=lf,
                     stderr=subprocess.STDOUT,
                     text=True,
-                    timeout=1800,  # 30 minute safety timeout
+                    timeout=effective_timeout,
                 )
                 returncode = proc.returncode
             except subprocess.TimeoutExpired:
-                lf.write("\n\n[ERROR]: Antigravity execution timed out after 30 minutes.\n")
+                _log(f"[ERROR]: Antigravity execution timed out after {effective_timeout}s.")
                 returncode = 124
             except Exception as e:
-                lf.write(f"\n\n[ERROR]: Failed to launch agy: {str(e)}\n")
+                _log(f"[ERROR]: Failed to launch agy: {str(e)}")
                 returncode = 1
 
         duration = time.time() - start_time
+        _log(f"=== AGY EXECUTION END (exit {returncode}, duration {duration:.1f}s) ===")
         return self._extract_report(task, worktree_path, returncode, duration)
 
     def _extract_report(
@@ -138,7 +214,7 @@ Do not modify files outside your assigned scope. Start now.
         returncode: int,
         duration: float,
     ) -> TaskReport:
-        """Parse TASK_REPORT.json or construct a fallback report from git state."""
+        """Parse TASK_REPORT.json or construct a fallback report from git or workspace state."""
         report_json_path = worktree_path / "TASK_REPORT.json"
         report_data: Dict[str, Any] = {}
 
@@ -148,35 +224,39 @@ Do not modify files outside your assigned scope. Start now.
             except Exception:
                 report_data = {}
 
-        # Inspect git commit and diff
+        # Inspect git commit and diff if Git repo
         git_commit = None
         diff_stat = None
-        rev_res = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=str(worktree_path),
-            capture_output=True,
-            text=True,
-        )
-        if rev_res.returncode == 0:
-            git_commit = rev_res.stdout.strip()
+        changed_files = []
 
-        stat_res = subprocess.run(
-            ["git", "diff", "--stat", "HEAD~1"],
-            cwd=str(worktree_path),
-            capture_output=True,
-            text=True,
-        )
-        if stat_res.returncode == 0:
-            diff_stat = stat_res.stdout.strip()
+        is_git = (worktree_path / ".git").exists() or shutil.which("git") is not None
+        if is_git:
+            rev_res = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=str(worktree_path),
+                capture_output=True,
+                text=True,
+            )
+            if rev_res.returncode == 0:
+                git_commit = rev_res.stdout.strip()
 
-        # Check modified files via git
-        changed_res = subprocess.run(
-            ["git", "diff", "--name-only", "HEAD~1"],
-            cwd=str(worktree_path),
-            capture_output=True,
-            text=True,
-        )
-        changed_files = [l.strip() for l in changed_res.stdout.splitlines() if l.strip()]
+            stat_res = subprocess.run(
+                ["git", "diff", "--stat", "HEAD~1"],
+                cwd=str(worktree_path),
+                capture_output=True,
+                text=True,
+            )
+            if stat_res.returncode == 0:
+                diff_stat = stat_res.stdout.strip()
+
+            changed_res = subprocess.run(
+                ["git", "diff", "--name-only", "HEAD~1"],
+                cwd=str(worktree_path),
+                capture_output=True,
+                text=True,
+            )
+            if changed_res.returncode == 0:
+                changed_files = [l.strip() for l in changed_res.stdout.splitlines() if l.strip()]
 
         status_str = report_data.get("status", "completed" if returncode == 0 else "failed")
         task_status = TaskStatus.COMPLETED if status_str == "completed" and returncode == 0 else TaskStatus.FAILED
