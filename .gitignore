@@ -3,3 +3,14 @@
 .worktrees/
 TASK_REPORT.json
 *.agent-log
+
+# Python cache & build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.venv/
+env/
+venv/
