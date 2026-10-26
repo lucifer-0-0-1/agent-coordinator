@@ -348,7 +348,7 @@ Updated report saved at: .coordinator/reports/{report.task_id}_report.md
             num_lines = arguments.get("lines", 25)
             log_info = orch.get_live_logs(task_id=task_id, lines=num_lines)
             if not log_info.get("found"):
-                return {"content": [{"type": "text", "text": log_info.get("message", "No active or recent logs found.")]}
+                return {"content": [{"type": "text", "text": log_info.get("message", "No active or recent logs found.")}]}
             tail_text = "\n".join(log_info.get("tail", []))
             res_text = f"""📄 Log: {log_info.get('log_file')}
 Last updated: {log_info.get('modified_seconds_ago', 0):.1f}s ago | Total lines: {log_info.get('total_lines')}
